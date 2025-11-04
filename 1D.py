@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Drive straight until an obstacle is detected with LiDAR.
-Then stop (or back up slightly if too close).
+Drive straight until an obstacle is detected using LiDAR.
+Stops or backs up based on distance in front of the robot.
 """
 
 import time
@@ -10,16 +10,16 @@ import inspect
 from mbot_bridge.api import MBot
 
 # ---------------- CONFIGURATION ----------------
-STOP_DIST = 0.5       # stop if obstacle closer than this (m)
-BACKUP_DIST = 0.3     # reverse if closer than this (m)
-FWD_SPEED = 0.25      # forward speed (m/s)
-REV_SPEED = -0.20     # reverse speed (m/s)
-WINDOW = 8            # number of rays for front detection
-LOOP_HZ = 10          # control loop rate
+STOP_DIST = 0.5       # Stop if obstacle is closer than this (meters)
+BACKUP_DIST = 0.3     # Back up if object is closer than this (meters)
+FWD_SPEED = 0.25      # Forward speed (m/s)
+REV_SPEED = -0.20     # Reverse speed (m/s)
+WINDOW = 8            # Number of rays near the front to average
+LOOP_HZ = 10          # Control loop rate (Hz)
 # ------------------------------------------------
 
 def find_fwd_dist(ranges, thetas, window=WINDOW):
-    """Compute the average forward distance from LiDAR."""
+    """Compute the average forward distance from LiDAR data."""
     if not ranges or not thetas:
         return np.inf
 
@@ -34,6 +34,7 @@ def find_fwd_dist(ranges, thetas, window=WINDOW):
     fwd_dists = fwd_dists[fwd_dists > 0]
     if fwd_dists.size == 0:
         return np.inf
+
     return float(np.mean(fwd_dists))
 
 # ---- Motion adapter ----
@@ -55,7 +56,7 @@ class Driver:
             raise RuntimeError("No valid drive function found on MBot")
 
     def send(self, vx):
-        """Send forward/backward velocity (no rotation)."""
+        """Send a pure forward/backward velocity command (no rotation)."""
         if self.mode == "drive_vx_vy_wz":
             self.bot.drive(vx, 0.0, 0.0)
         elif self.mode == "drive_vx":
@@ -72,21 +73,21 @@ class Driver:
             self.send(0.0)
 
 def main():
-    robot = MBot()
-    driver = Driver(robot)
-    print(f"[INFO] Starting: Drive forward until obstacle closer than {STOP_DIST} m")
+    bot = MBot()
+    driver = Driver(bot)
+    print(f"[INFO] Starting: driving straight until obstacle < {STOP_DIST} m")
 
     try:
         while True:
             # ---- READ LIDAR ----
-            ranges, thetas = [], []
-            robot.readLidarScan(ranges, thetas)  # LiDAR data source
-            dist = find_fwd_dist(ranges, thetas)
-            print(f"Distance to obstacle: {dist:.2f} m")
+            ranges, thetas = bot.read_lidar()   # ✅ your LiDAR call
 
-            # ---- CONTROL LOGIC ----
+            # ---- COMPUTE DISTANCE ----
+            dist = find_fwd_dist(ranges, thetas)
+            print(f"Front distance: {dist:.2f} m")
+
+            # ---- CONTROL ----
             if not np.isfinite(dist):
-                # No data — move forward cautiously
                 vx = FWD_SPEED * 0.5
             elif dist <= BACKUP_DIST:
                 print("[ACTION] Too close! Reversing...")
@@ -101,7 +102,7 @@ def main():
             time.sleep(1.0 / LOOP_HZ)
 
     except KeyboardInterrupt:
-        print("\n[INFO] Stopping robot (Ctrl+C).")
+        print("\n[INFO] Keyboard interrupt — stopping robot.")
     except Exception as e:
         print(f"[ERROR] {e}")
     finally:
