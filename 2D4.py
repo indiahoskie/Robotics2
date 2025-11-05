@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Follow Me 2D (LiDAR) — Straight-Line, Calm
-- Always moves directly toward the nearest nonzero LiDAR return (attractor-only)
-- No angle smoothing or rate limiting (avoids curved paths)
-- Vector acceleration limiting to keep direction straight while smoothing motion
+Follow Me 2D (LiDAR) — Align-Then-Dash (Straight-Line Segments)
+- State machine:
+    ALIGN:   move sideways (vy only) until the target is centered (|theta| small)
+    DASH:    move straight forward (vx only) toward the target
+- If the target drifts off-center, return to ALIGN briefly, then DASH again.
 - Pure translation (vx, vy); rotation locked (wz = 0.0)
 """
 
@@ -14,21 +15,26 @@ import inspect
 from mbot_bridge.api import MBot
 
 # ============================== CONFIG ==============================
-# Speed shaping (gentle, but decisive)
-V_MAX               = 0.35     # top speed (m/s)
-V_MIN               = 0.02     # floor to overcome static friction (set 0.0 for no creep)
-K_SHAPE             = 1.2      # v_mag = V_MAX * tanh(K_SHAPE * d)
+# Alignment (sideways-only) behavior
+VY_ALIGN_MAX        = 0.30      # max lateral speed while aligning
+K_ALIGN             = 2.0       # tanh gain for mapping angle -> vy (vy = VY_ALIGN_MAX * tanh(K_ALIGN*|theta|))
+TH_ALIGN            = 0.12      # radians; enter DASH when |theta| <= TH_ALIGN
+TH_HYST             = 0.08      # extra margin to avoid chattering (return to ALIGN if |theta| > TH_ALIGN + TH_HYST)
 
-# Vector acceleration limiting (applies to the whole (vx,vy) vector)
-ACCEL_MAX           = 0.60     # m/s^2 (limit on the change of speed vector magnitude)
+# Dash (straight-in) behavior
+VX_DASH_MAX         = 0.35      # top forward speed (m/s)
+K_DASH              = 1.2       # distance shaping: vx = VX_DASH_MAX * tanh(K_DASH * d)
 
 # Stop very near
-NEAR_STOP_BAND_M    = 0.06     # within this distance, stop
+NEAR_STOP_BAND_M    = 0.06      # if d < this, stop
+
+# Vector acceleration limiting (keeps motion smooth without bending direction)
+ACCEL_MAX           = 0.60      # m/s^2 (limit on change of the (vx,vy) vector magnitude)
 
 # Loop / safety
 LOOP_HZ             = 30
 SCAN_TIMEOUT_S      = 0.20
-FOLLOW_SIGN         = +1.0     # flip to -1.0 if your frame is reversed
+FOLLOW_SIGN         = +1.0      # flip to -1.0 if your frame is reversed
 PRINT_DEBUG         = True
 # ====================================================================
 
@@ -36,31 +42,22 @@ def clamp(x, lo, hi):
     return lo if x < lo else hi if x > hi else x
 
 def find_min_nonzero(ranges, thetas):
-    """
-    Return (min_distance, angle_at_min) ignoring zero/invalid ranges.
-    If none valid, returns (np.inf, 0.0).
-    """
+    """Return (min_distance, angle_at_min) ignoring zero/invalid ranges. If none valid, (inf, 0)."""
     r = np.asarray(ranges, dtype=float)
     t = np.asarray(thetas, dtype=float)
     mask = r > 0.0
     if not np.any(mask):
-        return (np.inf, 0.0)
+        return (float("inf"), 0.0)
     r_valid = r[mask]
     t_valid = t[mask]
     idx = int(np.argmin(r_valid))
     return float(r_valid[idx]), float(t_valid[idx])
 
 class Driver:
-    """
-    Motion adapter:
-      - Prefers drive(vx, vy, wz)
-      - Falls back gracefully if only vx (or vx,wz) exists
-      - wz forced to 0.0 (no spin)
-    """
+    """Abstracts MBot motion APIs; locks wz = 0 (no spin)."""
     def __init__(self, bot: MBot):
         self.bot = bot
         self.mode = None
-
         if hasattr(bot, "drive"):
             sig = inspect.signature(bot.drive)
             if len(sig.parameters) >= 3:
@@ -70,12 +67,11 @@ class Driver:
             else:
                 self.mode = "drive_generic"
         elif hasattr(bot, "set_velocity"):
-            self.mode = "set_velocity"  # (vx, wz)
+            self.mode = "set_velocity"   # (vx, wz)
         elif hasattr(bot, "motors"):
-            self.mode = "motors"        # (left, right)
+            self.mode = "motors"         # (left, right)
         else:
             raise RuntimeError("No valid drive function found on MBot")
-
         if PRINT_DEBUG:
             print(f"[Driver] Using mode: {self.mode}")
 
@@ -84,11 +80,11 @@ class Driver:
         if self.mode == "drive_vx_vy_wz":
             self.bot.drive(vx, vy, wz)
         elif self.mode == "drive_vx":
-            self.bot.drive(vx)            # no vy channel; projects onto x only
+            self.bot.drive(vx)                  # vy ignored on this platform
         elif self.mode == "set_velocity":
-            self.bot.set_velocity(vx, 0.0)
+            self.bot.set_velocity(vx, 0.0)      # no lateral channel
         elif self.mode == "motors":
-            self.bot.motors(vx, vx)
+            self.bot.motors(vx, vx)             # equal wheels ~ straight
 
     def stop(self):
         if hasattr(self.bot, "stop"):
@@ -100,12 +96,16 @@ def main():
     bot = MBot()
     driver = Driver(bot)
 
+    # State machine
+    ALIGN, DASH = 0, 1
+    state = ALIGN
+
     last_scan_time = time.time()
 
-    # Previous commanded velocity (for vector accel limiting)
+    # Previous commanded velocity for vector accel limiting
     vx_prev, vy_prev = 0.0, 0.0
 
-    print("[INFO] Follow-Me 2D (straight-line) started. No spinning; moves directly toward nearest obstacle.")
+    print("[INFO] Follow-Me 2D (Align-Then-Dash) started. No spinning; straight-line segments toward the target.")
 
     try:
         period = 1.0 / LOOP_HZ
@@ -114,7 +114,6 @@ def main():
 
             # ------------------ READ LIDAR ------------------
             ranges, thetas = bot.read_lidar()
-
             now = time.time()
             if now - last_scan_time > SCAN_TIMEOUT_S:
                 driver.send(0.0, 0.0, 0.0)
@@ -125,7 +124,7 @@ def main():
 
             if PRINT_DEBUG:
                 if np.isfinite(d_min):
-                    print(f"[SCAN] min_dist={d_min:.3f} m at theta={th_min:+.3f} rad")
+                    print(f"[SCAN] min_dist={d_min:.3f} m at theta={th_min:+.3f} rad | state={'ALIGN' if state==ALIGN else 'DASH'}")
                 else:
                     print("[SCAN] No valid returns.")
 
@@ -134,30 +133,40 @@ def main():
                 time.sleep(period)
                 continue
 
-            # --------------- DIRECT DIRECTION (NO SMOOTHING) ---------------
-            # Always point the velocity exactly toward the nearest return.
+            # --------------- STATE TRANSITIONS ---------------
+            th_abs = abs(th_min)
             d = max(d_min, 0.0)
             if d < NEAR_STOP_BAND_M:
+                # Close enough: stop but remain in current state
                 v_des_x, v_des_y = 0.0, 0.0
             else:
-                # Speed shaping: smooth growth with distance; saturates to V_MAX
-                v_mag = V_MAX * math.tanh(K_SHAPE * d)
-                if v_mag > 0.0:
-                    v_mag = max(v_mag, V_MIN)
-                # Unit direction straight at target (no lag)
-                ux = math.cos(th_min)
-                uy = math.sin(th_min)
-                v_des_x = FOLLOW_SIGN * v_mag * ux
-                v_des_y = FOLLOW_SIGN * v_mag * uy
+                if state == ALIGN:
+                    if th_abs <= TH_ALIGN:
+                        state = DASH
+                elif state == DASH:
+                    if th_abs > TH_ALIGN + TH_HYST:
+                        state = ALIGN
+
+                # --------------- STATE ACTIONS ---------------
+                if state == ALIGN:
+                    # Sideways-only to center the target (no forward)
+                    vy_mag = VY_ALIGN_MAX * math.tanh(K_ALIGN * th_abs)
+                    vy_dir = 1.0 if th_min >= 0.0 else -1.0
+                    v_des_x = 0.0
+                    v_des_y = FOLLOW_SIGN * vy_mag * vy_dir
+
+                else:  # DASH
+                    # Straight-in: forward-only (no lateral)
+                    vx_mag = VX_DASH_MAX * math.tanh(K_DASH * d)
+                    v_des_x = FOLLOW_SIGN * vx_mag
+                    v_des_y = 0.0
 
             # --------------- VECTOR ACCELERATION LIMITING ---------------
-            # Limit change in the velocity *vector* to ACCEL_MAX * dt
             dt = max(time.time() - t0, 1e-3)
             dvx = v_des_x - vx_prev
             dvy = v_des_y - vy_prev
             dv_norm = math.hypot(dvx, dvy)
             dv_max = ACCEL_MAX * dt
-
             if dv_norm > dv_max:
                 scale = dv_max / dv_norm
                 dvx *= scale
@@ -165,18 +174,15 @@ def main():
 
             vx_cmd = vx_prev + dvx
             vy_cmd = vy_prev + dvy
-
-            # Save for next cycle
             vx_prev, vy_prev = vx_cmd, vy_cmd
 
             # --------------- SEND (NO SPIN) ---------------
             driver.send(vx_cmd, vy_cmd, 0.0)
 
             if PRINT_DEBUG:
-                v_cmd_mag = math.hypot(vx_cmd, vy_cmd)
-                print(f"[CMD] vx={vx_cmd:+.3f} m/s, vy={vy_cmd:+.3f} m/s, |v|={v_cmd_mag:.3f} | d={d:.3f} m")
+                print(f"[CMD] state={'ALIGN' if state==ALIGN else 'DASH'} | vx={vx_cmd:+.3f} m/s, vy={vy_cmd:+.3f} m/s | d={d:.3f} m, |theta|={th_abs:.3f} rad")
 
-            # Maintain loop period
+            # Keep loop timing
             loop_dt = time.time() - t0
             sleep_left = period - loop_dt
             if sleep_left > 0:
@@ -192,3 +198,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
