@@ -106,11 +106,8 @@ def main():
 
     try:
         while True:
-            # 1) Read LiDAR
-            ranges: List[float] = []
-            thetas: List[float] = []
-            # NOTE: Assignment specifies read_lidar_scan(ranges, thetas)
-            robot.read_lidar_scan(ranges, thetas)
+            # 1) Read LiDAR (UPDATED to use bot.read_lidar API)
+            ranges, thetas = robot.read_lidar()
 
             # 2) Find closest wall point (distance & direction)
             d_min, th_min = find_min_dist(ranges, thetas)
