@@ -22,7 +22,7 @@ from mbot_bridge.api import MBot
 
 # ---------------- CONFIG ----------------
 # Control mode
-USE_BANG_BANG = False   # set True for Bang-Bang, False for P-control
+USE_BANG_BANG = False   # True = Bang-Bang, False = P-control
 
 # Distance target
 SETPOINT = 0.50         # desired distance (m) from the wall (closest obstacle)
@@ -31,7 +31,7 @@ DEAD_BAND = 0.04        # no correction if |error| <= DEAD_BAND
 # P-control gain (only if USE_BANG_BANG == False)
 KP = 0.9                # correction speed (m/s) per meter of error
 
-# Bang-Bang lateral correction speed (only if USE_BANG_BANG == True)
+# Bang-Bang lateral correction speed
 BANG_V = 0.25           # magnitude of lateral correction (m/s)
 
 # Forward motion along wall (tangent)
@@ -57,7 +57,6 @@ def find_min_dist(ranges: List[float], thetas: List[float]) -> Tuple[float, floa
     rg = np.asarray(ranges, dtype=float)
     th = np.asarray(thetas, dtype=float)
 
-    # Clip big values (optional but helps with flaky scans)
     if CLIP_MAX_RANGE is not None:
         rg = np.clip(rg, 0.0, CLIP_MAX_RANGE)
 
@@ -65,10 +64,11 @@ def find_min_dist(ranges: List[float], thetas: List[float]) -> Tuple[float, floa
     if not np.any(valid):
         return float('inf'), 0.0
 
-    idx = int(np.argmin(rg[valid]))
-    # map back to original indices
+    # index within valid subset
+    idx_valid_min = int(np.argmin(rg[valid]))
+    # map to original index
     valid_idx = np.nonzero(valid)[0]
-    k = valid_idx[idx]
+    k = valid_idx[idx_valid_min]
 
     return float(rg[k]), float(th[k])
 
@@ -100,24 +100,21 @@ def clamp(x: float, lo: float, hi: float) -> float:
 
 
 def main():
-    robot = MBot()
+    bot = MBot()
     print("[INFO] Wall follower starting. Ctrl-C to stop.")
     print(f"[INFO] Mode: {'Bang-Bang' if USE_BANG_BANG else 'P-control'}; setpoint={SETPOINT:.2f} m")
 
     try:
         while True:
-            # 1) Read LiDAR
-            ranges: List[float] = []
-            thetas: List[float] = []
-            # NOTE: Assignment specifies read_lidar_scan(ranges, thetas)
-            robot.read_lidar_scan(ranges, thetas)
+            # 1) Read LiDAR (UPDATED: bot.read_lidar() returns (ranges, thetas))
+            ranges, thetas = bot.read_lidar()
 
             # 2) Find closest wall point (distance & direction)
             d_min, th_min = find_min_dist(ranges, thetas)
 
             # Defensive: if no data, stop this cycle
             if not math.isfinite(d_min):
-                robot.drive(0.0, 0.0, 0.0)
+                bot.drive(0.0, 0.0, 0.0)
                 time.sleep(0.05)
                 continue
 
@@ -125,35 +122,27 @@ def main():
             nx, ny = math.cos(th_min), math.sin(th_min)
             n_vec = [nx, ny, 0.0]
 
-            # 3) Tangent direction along the wall (parallel to wall)
-            #    Use cross product as requested: t = n x k_hat
-            #    where k_hat = [0, 0, 1] is +z.
-            tx, ty, _ = cross_product(n_vec, [0.0, 0.0, 1.0])  # = [ny, -nx, 0]
-            # Pick the tangent pointing "forward" in x if possible (so we don't go backward)
+            # 3) Tangent direction along the wall via cross product with +z
+            #    t = n x k_hat = [ny, -nx, 0]
+            tx, ty, _ = cross_product(n_vec, [0.0, 0.0, 1.0])
+            # Choose forward-facing tangent (positive x preference)
             if tx < 0.0:
                 tx, ty = -tx, -ty
-
-            # Normalize tangent
             tx, ty = unit(tx, ty)
 
-            # 4) Side-distance error & correction toward/away from wall (along normal)
+            # 4) Side-distance error & correction along normal
             error = SETPOINT - d_min  # + if too far from wall; - if too close
-
             if abs(error) <= DEAD_BAND:
                 corr = 0.0
             else:
-                if USE_BANG_BANG:
-                    corr = BANG_V if error > 0.0 else -BANG_V
-                else:
-                    corr = KP * error  # m -> m/s
+                corr = (BANG_V if USE_BANG_BANG else KP * error)
 
-            # Correction direction: move along +n if too far (error>0), along -n if too close
-            # So lateral correction vector = corr * n_hat
+            # Correction vector along ±normal (move toward wall if too far; away if too close)
             nxu, nyu = unit(nx, ny)
             vx_corr = corr * nxu
             vy_corr = corr * nyu
 
-            # 5) Compose final velocity: tangent motion + correction
+            # 5) Compose final velocity: tangent + correction
             vx_cmd = V_TAN * tx + vx_corr
             vy_cmd = V_TAN * ty + vy_corr
 
@@ -162,10 +151,9 @@ def main():
             vy_cmd = clamp(vy_cmd, -V_MAX, V_MAX)
 
             # 6) Send velocity (keep heading stable)
-            robot.drive(vx_cmd, vy_cmd, WZ_CMD)
+            bot.drive(vx_cmd, vy_cmd, WZ_CMD)
 
-            # Optional: small sleep for loop rate (~20 Hz)
-            time.sleep(0.05)
+            time.sleep(0.05)  # ~20 Hz
 
     except KeyboardInterrupt:
         print("\n[INFO] Ctrl-C received. Stopping.")
@@ -173,7 +161,7 @@ def main():
         print(f"[ERROR] {e}")
     finally:
         try:
-            robot.drive(0.0, 0.0, 0.0)
+            bot.drive(0.0, 0.0, 0.0)
         except Exception:
             pass
         print("[INFO] Robot stopped safely.")
@@ -181,3 +169,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
