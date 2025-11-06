@@ -1,197 +1,262 @@
 #!/usr/bin/env python3
 """
-MBot-Omni Wall Follower (Straight-Line, No Turning, PCA Fit)
-
-- Tracks a single side wall ('left' or 'right') using LiDAR points in a side sector.
-- Fits a line to those points via PCA to get a stable wall tangent and normal.
-- Drives parallel to the wall with constant forward speed and lateral P-correction.
-- Keeps heading fixed: wz = 0 (no rotation). Uses (vx, vy) only.
-- Uses bot.read_lidar() -> (ranges, thetas)
-
-This matches the assignment flow:
-  1) Detect wall (choose a side sector, gather points)
-  2) Find tangent via cross product / PCA (parallel to wall)
-  3) Apply correction (P-control) toward/away from wall
-  4) Convert to velocity and send
+Drive forward and follow a wall using LiDAR (left or right).
+- Auto-picks the nearer wall (within MAX_TRACK_DIST) unless locked
+- Maintains a side distance (SETPOINT) using two-beam wall estimation
+- If obstacle directly ahead -> stop or reverse
 """
 
 import time
 import math
 import numpy as np
-from typing import List, Tuple
+import inspect
 from mbot_bridge.api import MBot
 
-# ---------------- CONFIG ----------------
-TRACK_SIDE = 'left'    # 'left' or 'right' — pick ONE side to follow and stay on it
+# ---------------- CONFIGURATION ----------------
+# Distances (meters)
+SETPOINT        = 0.50   # desired distance to wall (side)
+MAX_TRACK_DIST  = 2.50   # ignore walls farther than this when picking a side
+FRONT_STOP_DIST = 0.60   # stop if something is this close ahead
+FRONT_BACKUP_DIST = 0.35 # back up if something is this close ahead
 
-# Sector selection (degrees, robot frame; +theta = CCW from +x)
-LEFT_CENTER_DEG   = 90
-RIGHT_CENTER_DEG  = -90
-SECTOR_HALF_WIDTH = 25     # +/- half-width around the side center (deg)
+# Speeds
+FWD_SPEED   = 0.25       # forward speed (m/s) when cruising
+REV_SPEED   = -0.18      # reverse speed (m/s)
+WZ_MAX      = 0.8        # max yaw rate (rad/s)
 
-# Range filtering (meters)
-MIN_RANGE = 0.05
-MAX_RANGE = 6.0
+# Control gains
+KP_DIST   = 1.4          # side distance P-gain
+K_ALPHA   = 0.9          # wall alignment gain (angle term)
+BIAS_WZ   = 0.0          # small constant bias if your robot drifts
 
-# Control targets
-SETPOINT = 0.50           # desired perpendicular distance to wall (m)
-DEAD_BAND = 0.03          # don't correct if |error| <= this
+# LiDAR sampling
+SECTOR_HALF_WIDTH_DEG = 20  # half width for sector averaging
+# Two-beam angles (degrees) for wall estimation on each side
+LEFT_THETA_DEG  = 70
+LEFT_DELTA_DEG  = 30       # second ray at 70+30 = 100 deg
+RIGHT_THETA_DEG = -70
+RIGHT_DELTA_DEG = -30      # second ray at -70-30 = -100 deg
 
-# Speeds (m/s)
-V_TAN   = 0.25            # along-wall speed magnitude
-VY_MAX  = 0.35            # max lateral correction magnitude
-VX_MAX  = 0.45            # clamp safety
-WZ_CMD  = 0.0             # lock heading (no turning)
-
-# Controller gain (m -> m/s)
-KP = 0.9
-
-# Loop
-LOOP_HZ = 15
-# ----------------------------------------
-
-
-def clamp(x: float, lo: float, hi: float) -> float:
-    return lo if x < lo else hi if x > hi else x
+LOOP_HZ = 12
+PRINT_EVERY = 6            # print every N loops
+# ------------------------------------------------
 
 
-def side_sector_mask(thetas: np.ndarray, side: str) -> np.ndarray:
-    """Boolean mask selecting rays in the left/right sector."""
-    center_deg = LEFT_CENTER_DEG if side == 'left' else RIGHT_CENTER_DEG
-    w = math.radians(SECTOR_HALF_WIDTH)
+def sector_mean(ranges, thetas, center_deg, half_width_deg):
+    """Mean range in an angular sector (degrees). Returns inf if none."""
+    if not ranges or not thetas:
+        return float('inf')
+    th = np.asarray(thetas)
+    rg = np.asarray(ranges, dtype=float)
+    w = math.radians(half_width_deg)
     c = math.radians(center_deg)
-    return (thetas > c - w) & (thetas < c + w)
+    mask = (rg > 0) & (th > c - w) & (th < c + w)
+    if not np.any(mask):
+        return float('inf')
+    return float(np.mean(rg[mask]))
 
 
-def collect_side_points(ranges: List[float], thetas: List[float], side: str) -> np.ndarray:
+def interp_range_at_angle(ranges, thetas, target_rad):
     """
-    From LiDAR (ranges, thetas), select valid points in the chosen side sector
-    and convert to Cartesian (x,y) in robot frame.
-    Returns Nx2 array of points.
+    Get an interpolated range at a desired angle (radians).
+    Falls back to nearest ray if interpolation insufficient.
+    Returns np.inf if no valid data.
     """
     if not ranges or not thetas:
-        return np.empty((0, 2))
+        return float('inf')
 
-    r = np.asarray(ranges, dtype=float)
-    th = np.asarray(thetas, dtype=float)
+    th = np.asarray(thetas)
+    rg = np.asarray(ranges, dtype=float)
+    valid = rg > 0
+    if not np.any(valid):
+        return float('inf')
 
-    valid = (r > MIN_RANGE) & (r < MAX_RANGE)
-    sector = side_sector_mask(th, side)
-    mask = valid & sector
-    if not np.any(mask):
-        return np.empty((0, 2))
+    # Find nearest two valid indices around target
+    idx = np.searchsorted(th, target_rad)
+    candidates = []
 
-    r = r[mask]
-    th = th[mask]
+    # Collect a few neighbors to try to interpolate
+    for k in [idx-2, idx-1, idx, idx+1, idx+2]:
+        if 0 <= k < len(th) and valid[k]:
+            candidates.append((th[k], rg[k]))
 
-    x = r * np.cos(th)
-    y = r * np.sin(th)
-    return np.stack([x, y], axis=1)
+    if not candidates:
+        # fallback to nearest by absolute angle diff
+        k = int(np.argmin(np.abs(th - target_rad)))
+        val = rg[k]
+        return float(val) if val > 0 else float('inf')
+
+    # If we have at least two, do simple linear fit r(theta)
+    if len(candidates) >= 2:
+        thetas_c, ranges_c = zip(*sorted(candidates))
+        thetas_c = np.array(thetas_c)
+        ranges_c = np.array(ranges_c)
+        # least squares fit: r = a*theta + b
+        A = np.vstack([thetas_c, np.ones_like(thetas_c)]).T
+        a, b = np.linalg.lstsq(A, ranges_c, rcond=None)[0]
+        r_hat = a * target_rad + b
+        return float(r_hat if r_hat > 0 else float('inf'))
+
+    # Otherwise just return that single candidate
+    return float(candidates[0][1])
 
 
-def pca_line(points: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
+def wall_estimate(ranges, thetas, side='left'):
     """
-    Fit a line to 2D points via PCA.
-    Returns (t_hat, n_hat, D):
-      t_hat: unit tangent vector along the wall (principal eigenvector)
-      n_hat: unit normal pointing from robot toward the wall (sign chosen so D>0)
-      D    : perpendicular distance from robot (origin) to the line (m, positive)
-    The line passes through the point mean 'mu' with direction t_hat.
+    Estimate wall angle (alpha) and perpendicular distance (D) using two beams.
+    side: 'left' or 'right'
+    Returns (D, alpha) where:
+      - D is perpendicular distance from robot to wall (m)
+      - alpha is wall orientation relative to robot x-axis (rad), 0 = parallel to x
+    Based on standard two-point wall follower geometry (F1TENTH style).
     """
-    mu = points.mean(axis=0)  # line goes approximately through mu
-    P = points - mu
-    C = P.T @ P / max(len(points) - 1, 1)  # covariance-like
+    if side == 'left':
+        theta = math.radians(LEFT_THETA_DEG)
+        delta = math.radians(LEFT_DELTA_DEG)
+    else:
+        theta = math.radians(RIGHT_THETA_DEG)
+        delta = math.radians(RIGHT_DELTA_DEG)
 
-    # Eigen decomposition: principal direction = eigenvector with largest eigenvalue
-    vals, vecs = np.linalg.eigh(C)
-    idx_max = int(np.argmax(vals))
-    t_hat = vecs[:, idx_max]   # 2-vector
-    t_hat = t_hat / (np.linalg.norm(t_hat) + 1e-9)
+    r1 = interp_range_at_angle(ranges, thetas, theta)        # at theta
+    r2 = interp_range_at_angle(ranges, thetas, theta + delta) # at theta + delta
 
-    # Normal is perpendicular to tangent: rotate t_hat by -90deg
-    n_hat = np.array([t_hat[1], -t_hat[0]])
-    n_hat = n_hat / (np.linalg.norm(n_hat) + 1e-9)
+    if not np.isfinite(r1) or not np.isfinite(r2):
+        return float('inf'), 0.0
 
-    # Signed distance from origin to the line through mu with normal n_hat:
-    # D_signed = n_hat · mu
-    D_signed = float(n_hat @ mu)
+    # alpha is the angle between the robot x-axis and the wall
+    # Formula: alpha = atan2(r1*cos(Δ) - r2, r1*sin(Δ))
+    alpha = math.atan2(r1 * math.cos(delta) - r2, r1 * math.sin(delta))
 
-    # Ensure n_hat points from robot toward the wall (D should be positive)
-    if D_signed < 0:
-        n_hat = -n_hat
-        D_signed = -D_signed
+    # For the side distance: D = r2 * cos(alpha)
+    D = r2 * math.cos(alpha)
 
-    # For left-wall tracking, we prefer the wall to be on +y side; for right, on -y.
-    # If that isn't the case, flip both t_hat and n_hat to maintain handedness.
-    if TRACK_SIDE == 'left' and (mu[1] < 0):
-        t_hat = -t_hat
-        n_hat = -n_hat
-        D_signed = float(-n_hat @ mu)  # recompute after flip to keep positive
-    elif TRACK_SIDE == 'right' and (mu[1] > 0):
-        t_hat = -t_hat
-        n_hat = -n_hat
-        D_signed = float(-n_hat @ mu)
+    # If tracking the right wall, flip the sign of alpha so the controller behaves symmetrically
+    if side == 'right':
+        alpha = -alpha
 
-    # Prefer forward-going tangent (positive x projection), so we don't drive backward
-    if t_hat[0] < 0:
-        t_hat = -t_hat  # flip along-wall direction only (normal stays as set above)
+    return float(D), float(alpha)
 
-    return t_hat, n_hat, D_signed
+
+# ---- Motion adapter ----
+class Driver:
+    def __init__(self, bot: MBot):
+        self.bot = bot
+        self.mode = None
+        if hasattr(bot, "drive"):
+            sig = inspect.signature(bot.drive)
+            if len(sig.parameters) >= 3:
+                self.mode = "drive_vx_vy_wz"
+            else:
+                self.mode = "drive_vx"
+        elif hasattr(bot, "motors"):
+            self.mode = "motors"
+        elif hasattr(bot, "set_velocity"):
+            self.mode = "set_velocity"
+        else:
+            raise RuntimeError("No valid drive function found on MBot")
+
+    def send(self, vx, wz=0.0):
+        if self.mode == "drive_vx_vy_wz":
+            self.bot.drive(vx, 0.0, wz)
+        elif self.mode == "drive_vx":
+            self.bot.drive(vx)  # NOTE: yaw ignored if platform lacks yaw API
+        elif self.mode == "set_velocity":
+            self.bot.set_velocity(vx, wz)
+        elif self.mode == "motors":
+            # crude differential mapping
+            left = vx - 0.25 * wz
+            right = vx + 0.25 * wz
+            self.bot.motors(left, right)
+
+    def stop(self):
+        if hasattr(self.bot, "stop"):
+            self.bot.stop()
+        else:
+            self.send(0.0, 0.0)
 
 
 def main():
     bot = MBot()
-    print(f"[INFO] Wall follower (PCA) starting. Side={TRACK_SIDE}, setpoint={SETPOINT:.2f} m, no turning (wz=0)")
+    driver = Driver(bot)
+    print(f"[INFO] Wall follower: setpoint={SETPOINT:.2f} m")
+
+    # State for side selection
+    side_lock = None   # 'left' or 'right' once we commit; set to None to allow auto-switch
+    loop = 0
 
     try:
         while True:
-            # Read LiDAR
             ranges, thetas = bot.read_lidar()
 
-            # Gather side points
-            pts = collect_side_points(ranges, thetas, TRACK_SIDE)
+            # Front safety
+            front_dist = sector_mean(ranges, thetas, center_deg=0, half_width_deg=SECTOR_HALF_WIDTH_DEG)
 
-            if pts.shape[0] < 10:
-                # Not enough points — creep forward cautiously, no lateral correction
-                bot.drive(0.15, 0.0, WZ_CMD)
-                time.sleep(1.0 / LOOP_HZ)
-                continue
+            # Choose side (if not locked): nearer wall within MAX_TRACK_DIST
+            left_sector  = sector_mean(ranges, thetas, center_deg=90,  half_width_deg=SECTOR_HALF_WIDTH_DEG)
+            right_sector = sector_mean(ranges, thetas, center_deg=-90, half_width_deg=SECTOR_HALF_WIDTH_DEG)
 
-            # Fit wall line via PCA
-            t_hat, n_hat, D = pca_line(pts)   # D is positive distance to wall
+            if side_lock is None:
+                candidates = []
+                if np.isfinite(left_sector) and left_sector < MAX_TRACK_DIST:
+                    candidates.append(('left', left_sector))
+                if np.isfinite(right_sector) and right_sector < MAX_TRACK_DIST:
+                    candidates.append(('right', right_sector))
+                if candidates:
+                    side_lock = min(candidates, key=lambda x: x[1])[0]
 
-            # P-control on perpendicular distance
-            error = SETPOINT - D  # + if too far; - if too close
-            if abs(error) <= DEAD_BAND:
-                corr = 0.0
+            # Default to left if nothing seen yet (you can change this)
+            if side_lock is None:
+                side_lock = 'left'
+
+            # Estimate wall geometry on the chosen side
+            D, alpha = wall_estimate(ranges, thetas, side=side_lock)
+
+            # Compute control
+            vx = FWD_SPEED
+            wz = 0.0
+
+            # Front collision handling
+            if np.isfinite(front_dist) and front_dist <= FRONT_BACKUP_DIST:
+                vx = REV_SPEED
+                wz = 0.0
+                action = "BACKUP (front too close)"
+            elif np.isfinite(front_dist) and front_dist <= FRONT_STOP_DIST:
+                vx = 0.0
+                wz = 0.0
+                action = "STOP (front obstacle)"
             else:
-                corr = KP * error
+                # Side distance control only if we have a sane estimate
+                if np.isfinite(D):
+                    e = SETPOINT - D          # positive if too far from wall
+                    # Combine distance and alignment (alpha) terms
+                    wz_cmd = KP_DIST * e + K_ALPHA * alpha + BIAS_WZ
+                    # Clamp
+                    wz = max(-WZ_MAX, min(WZ_MAX, wz_cmd))
+                    action = f"FOLLOW {side_lock.upper()} (e={e:+.2f}, alpha={alpha:+.2f})"
+                else:
+                    # No valid side reading → creep forward carefully
+                    vx = 0.15
+                    wz = 0.0
+                    action = "SEARCH (no side data)"
 
-            # Build velocity in robot frame:
-            #   along-wall:  V_TAN * t_hat
-            #   correction:  corr * n_hat  (strafe toward wall if too far, away if too close)
-            vx_cmd = V_TAN * t_hat[0] + corr * n_hat[0]
-            vy_cmd = V_TAN * t_hat[1] + corr * n_hat[1]
+            driver.send(vx, wz)
 
-            # Clamp
-            vx_cmd = clamp(vx_cmd, -VX_MAX, VX_MAX)
-            vy_cmd = clamp(vy_cmd, -VY_MAX, VY_MAX)
+            # periodic log
+            if (loop % PRINT_EVERY) == 0:
+                ls = left_sector if np.isfinite(left_sector) else float('inf')
+                rs = right_sector if np.isfinite(right_sector) else float('inf')
+                fd = front_dist if np.isfinite(front_dist) else float('inf')
+                print(f"[L:{ls:4.2f}  F:{fd:4.2f}  R:{rs:4.2f}]  side={side_lock}  D={D:4.2f}  α={alpha:+.2f}  → vx={vx:+.2f} wz={wz:+.2f}  | {action}")
 
-            # Send (no turn)
-            bot.drive(vx_cmd, vy_cmd, WZ_CMD)
-
-            # Loop rate
+            loop += 1
             time.sleep(1.0 / LOOP_HZ)
 
     except KeyboardInterrupt:
-        print("\n[INFO] Ctrl-C received. Stopping.")
+        print("\n[INFO] Keyboard interrupt — stopping robot.")
     except Exception as e:
         print(f"[ERROR] {e}")
     finally:
-        try:
-            bot.drive(0.0, 0.0, 0.0)
-        except Exception:
-            pass
+        driver.stop()
         print("[INFO] Robot stopped safely.")
 
 
