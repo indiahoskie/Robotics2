@@ -1,229 +1,137 @@
-#!/usr/bin/env python3
-"""
-MBot Wall Follower (stable, no oscillation)
-- Tracks ONLY the chosen side sector (left or right), not the global min
-- Smooths side distance to suppress jitter
-- Drives forward at constant V_TAN, strafes laterally to maintain setpoint
-- wz = 0 (no turning)
-"""
-
-import time, math
-from typing import List, Tuple
+import time
+import math
 import numpy as np
+from mbot_bridge.api import MBot
 
-# -------- Robust import for MBot --------
-MBot = None
-_import_err = None
-for modpath in ("mbot_bridge.api", "mbot.api", "mbot_bridge", "mbot"):
-    try:
-        module = __import__(modpath, fromlist=["MBot"])
-        if hasattr(module, "MBot"):
-            MBot = getattr(module, "MBot")
-            break
-        if hasattr(module, "api") and hasattr(module.api, "MBot"):
-            MBot = getattr(module.api, "MBot")
-            break
-    except Exception as e:
-        _import_err = e
-if MBot is None:
-    raise SystemExit(
-        "MBot SDK not found. Install on the ROBOT:\n"
-        "  python3 -m pip install mbot-bridge  (or mbot_bridge)\n"
-        "or install your course SDK repo: python3 -m pip install -e .\n\n"
-        f"Last import error: {_import_err}"
-    )
 
-# ===================== CONFIG =====================
-TRACK_LEFT = True          # True = follow left wall, False = right wall
-USE_BANG_BANG = False      # keep P-control unless you must switch
-SETPOINT = 0.50            # meters to wall (side distance)
-DEAD_BAND = 0.03           # meters: no correction inside this band
-KP = 1.0                   # P gain for lateral correction
-BANG_V = 0.25              # bang-bang lateral speed (if enabled)
+def find_min_dist(ranges, thetas):
+    """Find the length and angle of the minimum VALID ray in the scan.
+    Ignores zeros (invalid). Returns (min_dist, min_angle).
+    """
+    if not ranges or not thetas or len(ranges) != len(thetas):
+        return float('inf'), 0.0
 
-V_TAN = 0.20               # constant forward speed
-VY_MAX = 0.35              # clamp for |vy|
-VX_MAX = 0.35
-WZ_CMD = 0.0               # keep heading fixed
+    rg = np.asarray(ranges, dtype=float)
+    th = np.asarray(thetas, dtype=float)
 
-CLIP_MAX_RANGE = 8.0       # ignore crazy long returns
-FRONT_STOP_DIST = 0.30     # stop if something directly ahead is too close
+    valid = rg > 0.0
+    if not np.any(valid):
+        return float('inf'), 0.0
 
-# Side sector to look for the wall (degrees from forward, CCW positive)
-# Left wall: +60..+120 deg ; Right wall: -120..-60 deg
-SIDE_MIN_DEG = 60.0
-SIDE_MAX_DEG = 120.0
+    # index of the minimum among valid entries
+    valid_idx = np.nonzero(valid)[0]
+    k = valid_idx[np.argmin(rg[valid])]
+    return float(rg[k]), float(th[k])
 
-# Smoothing
-EMA_ALPHA = 0.3            # 0..1, higher = snappier
-# Loop rate
-LOOP_HZ = 15
-# ==================================================
 
-# -------- API name shims --------
-def read_lidar(bot) -> Tuple[list, list]:
-    for name in ("read_lidar", "readLidar", "read_lidar_scan", "readLidarScan", "get_lidar"):
-        if hasattr(bot, name):
-            out = getattr(bot, name)()
-            if isinstance(out, tuple) and len(out) == 2:
-                return out
-            if isinstance(out, dict) and "ranges" in out and "thetas" in out:
-                return out["ranges"], out["thetas"]
-    raise RuntimeError("No LiDAR read method found.")
+def cross_product(v1, v2):
+    """Compute the Cross Product between two vectors (length 3)."""
+    a = np.asarray(v1, dtype=float)
+    b = np.asarray(v2, dtype=float)
+    return np.cross(a, b)
 
-def drive(bot, vx: float, vy: float, wz: float):
-    for name in ("drive", "cmd_vel", "set_cmd_vel", "set_velocity"):
-        if hasattr(bot, name):
-            getattr(bot, name)(vx, vy, wz)
-            return
-    if hasattr(bot, "drive"):
-        bot.drive(vx, vy, wz)
-    else:
-        raise RuntimeError("No drive method found.")
 
-# -------- Helpers --------
-def clamp(x: float, lo: float, hi: float) -> float:
+# --------- simple helpers ----------
+def unit2(vx, vy):
+    n = math.hypot(vx, vy)
+    return (0.0, 0.0) if n < 1e-9 else (vx / n, vy / n)
+
+def clamp(x, lo, hi):
     return lo if x < lo else hi if x > hi else x
 
-def ang_norm(a: float) -> float:
-    # wrap angle to [-pi, pi]
-    a = (a + math.pi) % (2*math.pi) - math.pi
-    return a
-
-def sector_mask(thetas: np.ndarray, deg_min: float, deg_max: float) -> np.ndarray:
-    """Return boolean mask for angles within [deg_min, deg_max] in *degrees*,
-       converting to radians and handling wrap correctly."""
-    rmin = math.radians(deg_min)
-    rmax = math.radians(deg_max)
-    th = np.array([ang_norm(t) for t in thetas], dtype=float)
-    # handle no wrap (e.g., +60..+120) vs wrap (e.g., -120..-60 also fine here)
-    if rmin <= rmax:
-        return (th >= rmin) & (th <= rmax)
+def drive(robot, vx, vy, wz):
+    """Call the appropriate drive method (course images vary)."""
+    if hasattr(robot, "drive"):
+        robot.drive(vx, vy, wz)
+    elif hasattr(robot, "set_cmd_vel"):
+        robot.set_cmd_vel(vx, vy, wz)
+    elif hasattr(robot, "cmd_vel"):
+        robot.cmd_vel(vx, vy, wz)
     else:
-        # wrapped range (not used in our chosen numbers, but safe)
-        return (th >= rmin) | (th <= rmax)
+        raise RuntimeError("No drive command found on MBot (expected drive/set_cmd_vel/cmd_vel).")
 
-def robust_side_distance(
-    ranges: List[float],
-    thetas: List[float],
-    track_left: bool,
-) -> Tuple[float, bool]:
-    """Return (side_distance_m, valid). Uses only side sector and robust statistic."""
-    if not ranges or not thetas or len(ranges) != len(thetas):
-        return float("inf"), False
-    rg = np.asarray(ranges, dtype=float)
-    th = np.asarray(thetas, dtype=float)
 
-    if CLIP_MAX_RANGE is not None:
-        rg = np.clip(rg, 0.0, CLIP_MAX_RANGE)
+robot = MBot()
 
-    # Pick sector based on side
-    if track_left:
-        m = sector_mask(th, SIDE_MIN_DEG, SIDE_MAX_DEG)   # +60..+120°
-    else:
-        # mirror to right: -120..-60 deg
-        m = sector_mask(th, -SIDE_MAX_DEG, -SIDE_MIN_DEG)
+# ---------------- TUNABLES ----------------
+setpoint = 0.50       # desired distance to the wall (meters)
+KP = 1.0              # lateral P gain
+DEAD_BAND = 0.03      # meters; ignore tiny errors
+V_TAN = 0.22          # m/s forward-along-wall speed
+V_MAX = 0.45          # clamp for |vx|, |vy|
+WZ_CMD = 0.0          # keep heading fixed; (you can add yaw control later)
+CLIP_MAX_RANGE = 8.0  # optional sanity; ignore crazy long returns
+LOOP_DT = 0.07        # ~14 Hz
+# ------------------------------------------
 
-    # valid = nonzero range & in sector
-    valid = (rg > 0.0) & m
-    if not np.any(valid):
-        return float("inf"), False
 
-    sector_vals = rg[valid]
+try:
+    print(f"[INFO] Following nearest wall with shortest-ray method. Setpoint={setpoint:.2f} m")
+    while True:
+        # Read the latest lidar scan.
+        ranges, thetas = robot.read_lidar()
 
-    # Robust estimate: use median, not min
-    d_side = float(np.median(sector_vals))
-    return d_side, True
+        # Optional: clip long weird returns for stability
+        if CLIP_MAX_RANGE is not None:
+            ranges = np.clip(ranges, 0.0, CLIP_MAX_RANGE).tolist()
 
-def front_too_close(ranges: List[float], thetas: List[float], stop_dist: float) -> bool:
-    if not ranges or not thetas:
-        return False
-    rg = np.asarray(ranges, dtype=float)
-    th = np.asarray(thetas, dtype=float)
-    # consider a narrow front window ±10°
-    mask = sector_mask(th, -10.0, 10.0)
-    vals = rg[(rg > 0.0) & mask]
-    if vals.size == 0:
-        return False
-    return np.min(vals) < stop_dist
+        # 1) Find closest ray (distance & angle)
+        d_min, th_min = find_min_dist(ranges, thetas)
 
-# -------- Controller (side-distance only; no global-min chasing) --------
-_prev_d_ema = None
+        # If no valid reading, stop briefly and retry
+        if not math.isfinite(d_min):
+            drive(robot, 0.0, 0.0, 0.0)
+            time.sleep(LOOP_DT)
+            continue
 
-def compute_vx_vy(
-    d_side: float,
-    valid: bool,
-    setpoint_m: float,
-    track_left: bool,
-    kp: float,
-    dead_band: float,
-    use_bang_bang: bool,
-    bang_v: float,
-) -> Tuple[float, float]:
-    global _prev_d_ema
+        # 2) Build wall normal (toward obstacle) and tangent (parallel to wall)
+        nx, ny = math.cos(th_min), math.sin(th_min)        # normal toward the wall
+        tx, ty, _ = cross_product([nx, ny, 0.0], [0.0, 0.0, 1.0])  # t = n x k_hat = [ny, -nx, 0]
 
-    # Smooth the distance
-    if not valid or not math.isfinite(d_side):
-        # no sight of wall → no lateral correction
-        return V_TAN, 0.0
+        # Prefer "forward-ish" tangent (positive x projection)
+        if tx < 0.0:
+            tx, ty = -tx, -ty
 
-    if _prev_d_ema is None:
-        d_ema = d_side
-    else:
-        d_ema = EMA_ALPHA * d_side + (1.0 - EMA_ALPHA) * _prev_d_ema
-    _prev_d_ema = d_ema
+        # Normalize
+        tx, ty = unit2(tx, ty)
+        nxu, nyu = unit2(nx, ny)
 
-    # Positive error means "too far from the wall"
-    error = setpoint_m - d_ema
+        # 3) Lateral distance error: positive if we're too far from the wall
+        error = setpoint - d_min
 
-    # Desired vy sign: +vy is left strafe in MBot frame.
-    # If tracking LEFT: error>0 (too far) → +vy (move left toward wall)
-    # If tracking RIGHT: mirror sign.
-    if not track_left:
-        error = -error
+        # Deadband to avoid tiny oscillations
+        if abs(error) <= DEAD_BAND:
+            corr = 0.0
+        else:
+            corr = KP * error
 
-    if abs(error) <= dead_band:
-        vy = 0.0
-    else:
-        vy = bang_v * (1 if error > 0 else -1) if use_bang_bang else kp * error
+        # 4) Compose velocity: go along-wall + small push toward/away from wall
+        vx_cmd = V_TAN * tx + corr * nxu
+        vy_cmd = V_TAN * ty + corr * nyu
 
-    vy = clamp(vy, -VY_MAX, VY_MAX)
-    vx = clamp(V_TAN, -VX_MAX, VX_MAX)  # keep constant forward motion
-    return vx, vy
+        # clamp speeds
+        vx_cmd = clamp(vx_cmd, -V_MAX, V_MAX)
+        vy_cmd = clamp(vy_cmd, -V_MAX, V_MAX)
 
-# -------- Main --------
-def main():
-    bot = MBot()
-    side = "LEFT" if TRACK_LEFT else "RIGHT"
-    mode = "Bang-Bang" if USE_BANG_BANG else "P"
-    print(f"[INFO] Wall follower: side={side}, mode={mode}, setpoint={SETPOINT:.2f} m")
+        # 5) Drive (no rotation for this assignment)
+        drive(robot, vx_cmd, vy_cmd, WZ_CMD)
 
+        # Optionally, sleep
+        time.sleep(LOOP_DT)
+
+except KeyboardInterrupt:
+    pass
+except Exception as e:
+    print(f"[ERROR] {e}")
+finally:
     try:
-        while True:
-            ranges, thetas = read_lidar(bot)
-
-            # Safety: stop if something too close in front
-            if front_too_close(ranges, thetas, FRONT_STOP_DIST):
-                drive(bot, 0.0, 0.0, 0.0)
-                time.sleep(0.05)
-                continue
-
-            d_side, ok = robust_side_distance(ranges, thetas, TRACK_LEFT)
-            vx, vy = compute_vx_vy(
-                d_side, ok, SETPOINT, TRACK_LEFT, KP, DEAD_BAND, USE_BANG_BANG, BANG_V
-            )
-            drive(bot, vx, vy, WZ_CMD)
-            time.sleep(1.0 / LOOP_HZ)
-
-    except KeyboardInterrupt:
-        print("\n[INFO] Ctrl-C received. Stopping.")
-    finally:
+        robot.stop()
+    except Exception:
+        # fallback if stop() isn't available
         try:
-            drive(bot, 0.0, 0.0, 0.0)
+            drive(robot, 0.0, 0.0, 0.0)
         except Exception:
             pass
-        print("[INFO] Robot stopped safely.")
+    print("[INFO] Robot stopped.")
 
-if __name__ == "__main__":
-    main()
 
