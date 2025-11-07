@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
-Follow Me 2D (LiDAR) — Straight-Line for Unknown MBot API
-- Autodetects available motion API and uses the best matching control:
-    * drive(vx, wz)            -> diff-drive align (turn) then dash straight
-    * set_velocity(vx, wz)     -> same as above
-    * drive(vx, vy, wz)        -> holonomic: we still do rotate-then-dash to ensure straight lines
-    * turn(wz) + drive(vx)     -> separate yaw & forward methods
-- If NO rotation method is available, we abort gracefully (can't align without yaw control).
+Follow Me 2D (LiDAR) - Improved Version
+- Finds the nearest obstacle (ignoring zero ranges)
+- Moves the robot laterally toward that obstacle's direction
+- Maintains a setpoint distance using P-control
+- Does NOT spin: wz is held at 0.0 (pure translation in x/y)
+- Moves in whatever direction the obstacle is located
+
+Expected behavior:
+- Robot follows the nearest obstacle/human as they move around
+- Can move in multiple directions in the plane (2D) without rotating to face the target
+- Follows the shortest angle/distance continuously
 """
 
 import time
@@ -15,195 +19,255 @@ import numpy as np
 import inspect
 from mbot_bridge.api import MBot
 
-# ============================== CONFIG ==============================
-# Forward straight motion
-VX_MAX        = 0.35      # forward top speed (m/s)
-VX_MIN        = 0.05
-KX            = 1.2       # forward speed ~ KX * distance, clamped
+# ---------------------------- CONFIG ----------------------------
+SETPOINT_M      = 0.75     # desired distance to target (m)
+TOLERANCE_M     = 0.05     # acceptable error band around setpoint (m)
 
-# Turn-in-place alignment
-WZ_MAX        = 1.0       # max turn speed (rad/s)
-KW            = 3.0       # turn rate ~ KW * theta, clamped
-TH_ALIGN      = 0.10      # aligned when |theta| < TH_ALIGN radians (~6 deg)
+KP_DIST         = 1.2      # P gain for radial distance control (m/s per meter error)
 
-# Stop very near target
-NEAR_STOP     = 0.06      # meters
+V_MAX           = 0.55     # absolute cap on translational speed (m/s)
+V_MIN           = 0.08     # small floor to overcome static friction when moving (m/s)
+DEADBAND_M      = 0.03     # small deadband near zero error
 
-# Loop & logging
-LOOP_HZ       = 30
-PRINT_DEBUG   = True
-# ====================================================================
+# Reduced smoothing for faster response to direction changes
+SMOOTH_ALPHA    = 0.6      # EMA smoothing for theta_min (higher = faster response)
+
+SCAN_TIMEOUT_S  = 0.25     # if scans lag beyond this, stop for safety
+LOOP_HZ         = 20       # control loop rate (increased for better response)
+
+PRINT_DEBUG     = True
+# -----------------------------------------------------------------
 
 def clamp(x, lo, hi):
+    """Clamp value x between lo and hi"""
     return lo if x < lo else hi if x > hi else x
 
+def ema(prev, new, alpha):
+    """Exponential moving average for smooth transitions"""
+    return alpha * new + (1.0 - alpha) * prev
+
+def normalize_angle(angle):
+    """Normalize angle to [-pi, pi]"""
+    while angle > math.pi:
+        angle -= 2 * math.pi
+    while angle < -math.pi:
+        angle += 2 * math.pi
+    return angle
+
 def find_min_nonzero(ranges, thetas):
-    """Return (min_distance, angle_at_min) ignoring zero ranges; (inf, 0.0) if none."""
+    """
+    Return (min_distance, angle_at_min) ignoring zero/invalid ranges.
+    If nothing valid, returns (np.inf, 0.0)
+    
+    This implements findMinNonzeroDist() behavior:
+    - Ignores ranges that are 0.0 (bad lidar readings)
+    - Returns the shortest valid distance and its corresponding angle
+    """
     r = np.asarray(ranges, dtype=float)
     t = np.asarray(thetas, dtype=float)
+    
+    # Mask out zero and invalid ranges
     mask = r > 0.0
+    
     if not np.any(mask):
-        return (float("inf"), 0.0)
+        return (np.inf, 0.0)
+    
     r_valid = r[mask]
     t_valid = t[mask]
-    i = int(np.argmin(r_valid))
-    return float(r_valid[i]), float(t_valid[i])
+    
+    # Find minimum distance
+    idx = np.argmin(r_valid)
+    
+    return float(r_valid[idx]), float(t_valid[idx])
 
 class Driver:
     """
-    Motion adapter that probes the MBot API and exposes:
-        - send(vx, wz)  for diff-drive style control
-        - send_holo(vx, vy, wz) if full holonomic is available
-        - stop()
-    Internally, it will use one of:
-        * drive(vx, wz)
-        * set_velocity(vx, wz)
-        * drive(vx, vy, wz)
-        * turn(wz) + drive(vx)
+    Motion adapter for 2D planar movement without rotation.
+    Handles different MBot API versions gracefully.
     """
     def __init__(self, bot: MBot):
         self.bot = bot
         self.mode = None
 
-        # Try drive(...) and inspect its arity
         if hasattr(bot, "drive"):
-            try:
-                sig = inspect.signature(bot.drive)
-                n = len(sig.parameters)
-                # Common patterns we support:
-                if n >= 3:
-                    self.mode = "drive_vx_vy_wz"   # holonomic
-                elif n == 2:
-                    self.mode = "drive_vx_wz"      # diff-drive (ideal)
-                elif n == 1:
-                    # drive(vx) only — keep looking for a separate turn(...)
-                    self.mode = "drive_vx_only"
-                else:
-                    self.mode = "drive_unknown"
-            except Exception:
-                self.mode = "drive_unknown"
-
-        # If not settled on a usable mode yet, try set_velocity(vx, wz)
-        if self.mode in (None, "drive_unknown", "drive_vx_only"):
-            if hasattr(bot, "set_velocity"):
-                try:
-                    sig = inspect.signature(bot.set_velocity)
-                    if len(sig.parameters) >= 2:
-                        self.mode = "set_velocity_vx_wz"
-                except Exception:
-                    pass
-
-        # If we only have drive(vx), check for a dedicated turn(wz)-style method
-        self.turn_method = None
-        if self.mode == "drive_vx_only":
-            for name in ("turn", "rotate", "spin", "set_angular_velocity", "setYawRate", "yaw_rate"):
-                if hasattr(bot, name):
-                    self.turn_method = getattr(bot, name)
-                    self.mode = "drive_vx__plus_turn"   # forward via drive(vx), yaw via turn(wz)
-                    break
+            sig = inspect.signature(bot.drive)
+            # Prefer 3-parameter drive for full 2D control
+            if len(sig.parameters) >= 3:
+                self.mode = "drive_vx_vy_wz"  # Ideal: (vx, vy, wz)
+            elif len(sig.parameters) == 1:
+                self.mode = "drive_vx"        # Limited: (vx) only
+            else:
+                self.mode = "drive_generic"
+        elif hasattr(bot, "set_velocity"):
+            self.mode = "set_velocity"        # (vx, wz) - no lateral
+        elif hasattr(bot, "motors"):
+            self.mode = "motors"              # Low-level differential
+        else:
+            raise RuntimeError("No valid drive function found on MBot")
 
         if PRINT_DEBUG:
-            print(f"[Driver] Detected mode: {self.mode}")
+            print(f"[Driver] Using mode: {self.mode}")
 
-        # Final sanity: if we still don't have any way to command yaw, warn
-        self.can_rotate = self.mode in ("drive_vx_wz", "set_velocity_vx_wz", "drive_vx_vy_wz", "drive_vx__plus_turn")
+    def send(self, vx, vy=0.0, wz=0.0):
+        """
+        Send velocity commands to robot.
+        Always forces wz=0.0 to prevent spinning.
+        """
+        # CRITICAL: No spinning allowed in Follow 2D
+        wz = 0.0
 
-    def send(self, vx, wz):
-        """
-        Send diff-drive style command. If only holonomic is available, we set vy=0.
-        """
-        if self.mode == "drive_vx_wz":
-            self.bot.drive(vx, wz)
-        elif self.mode == "set_velocity_vx_wz":
-            self.bot.set_velocity(vx, wz)
-        elif self.mode == "drive_vx_vy_wz":
-            # Use vy=0 to ensure straight lines (we rotate only during align)
-            self.bot.drive(vx, 0.0, wz)
-        elif self.mode == "drive_vx__plus_turn":
-            # Issue yaw first (small dt), then forward
-            # Here we assume the turn method takes (wz) in rad/s; many APIs also accept (wz) directly.
-            try:
-                self.turn_method(wz)
-            except TypeError:
-                # Some APIs want (duration, speed) or different sigs; if this happens, fall back to zero turn.
-                pass
-            self.bot.drive(vx)
-        elif self.mode == "drive_vx_only":
-            # No yaw capability — cannot align, only straight. We choose to stop for safety.
-            self.bot.drive(0.0)
-            raise RuntimeError("No rotation method available (drive(vx) only) — cannot align to target.")
-        else:
-            raise RuntimeError("No supported drive mode detected on MBot.")
+        if self.mode == "drive_vx_vy_wz":
+            # Full 2D control - this is what we want!
+            self.bot.drive(vx, vy, wz)
+            
+        elif self.mode == "drive_vx":
+            # Limited: only forward/backward
+            # Project 2D velocity into x direction
+            v_total = math.sqrt(vx**2 + vy**2)
+            if vx < 0:
+                v_total = -v_total
+            self.bot.drive(v_total)
+            
+        elif self.mode == "set_velocity":
+            # Can't command vy, only vx
+            self.bot.set_velocity(vx, 0.0)
+            
+        elif self.mode == "motors":
+            # Differential drive approximation
+            # Both wheels same speed = straight motion
+            self.bot.motors(vx, vx)
 
     def stop(self):
-        try:
-            if hasattr(self.bot, "stop"):
-                self.bot.stop()
-            elif hasattr(self.bot, "drive"):
-                # Best-effort stop
-                sig = inspect.signature(self.bot.drive)
-                n = len(sig.parameters)
-                if n >= 3:
-                    self.bot.drive(0.0, 0.0, 0.0)
-                elif n == 2:
-                    self.bot.drive(0.0, 0.0)
-                elif n == 1:
-                    self.bot.drive(0.0)
-        except Exception:
-            pass
+        """Safely stop the robot"""
+        if hasattr(self.bot, "stop"):
+            self.bot.stop()
+        else:
+            self.send(0.0, 0.0, 0.0)
 
 def main():
     bot = MBot()
     driver = Driver(bot)
 
-    if not driver.can_rotate:
-        print("[ERROR] This MBot API exposes no rotation control (only drive(vx)).")
-        print("        Without yaw control, the robot cannot align to the target; exiting safely.")
-        return
+    # Smoothed theta for stable direction tracking
+    theta_smooth = None  # Start with None to initialize on first reading
+    last_scan_time = time.time()
 
-    print("[INFO] Follow-Me Straight-Line (API-adaptive) started.")
+    print("[INFO] Follow-Me 2D started (lateral movement, no spinning).")
+    print(f"[INFO] Setpoint: {SETPOINT_M}m, P-gain: {KP_DIST}, Max speed: {V_MAX} m/s")
+    print("[INFO] Robot will follow nearest obstacle in 2D without rotating.")
 
     try:
-        dt = 1.0 / LOOP_HZ
         while True:
-            # --- Read LiDAR ---
-            ranges, thetas = bot.read_lidar()
-            d, th = find_min_nonzero(ranges, thetas)
-
-            if not np.isfinite(d):
+            loop_start = time.time()
+            
+            # ---- READ LIDAR ----
+            # ranges: distances in meters (0.0 = invalid)
+            # thetas: angles in radians (0 = forward, +pi/2 = left, -pi/2 = right)
+            try:
+                ranges, thetas = bot.read_lidar()
+            except Exception as e:
+                print(f"[ERROR] Failed to read lidar: {e}")
                 driver.stop()
-                time.sleep(dt)
+                time.sleep(0.1)
                 continue
+            
+            now = time.time()
+            
+            # Safety: check for scan timeout
+            if now - last_scan_time > SCAN_TIMEOUT_S:
+                if PRINT_DEBUG:
+                    print("[WARN] Lidar scan timeout - stopping for safety")
+                driver.send(0.0, 0.0, 0.0)
+                
+            last_scan_time = now
 
-            # --- Align: rotate until object is centered ---
-            if abs(th) > TH_ALIGN:
-                vx_cmd = 0.0
-                wz_cmd = clamp(KW * th, -WZ_MAX, WZ_MAX)
-            else:
-                # --- Dash: go straight forward ---
-                if d < NEAR_STOP:
-                    vx_cmd = 0.0
-                else:
-                    vx_cmd = clamp(KX * d, VX_MIN, VX_MAX)
-                wz_cmd = 0.0
-
-            # --- Send to robot (API-adaptive) ---
-            driver.send(vx_cmd, wz_cmd)
+            # ---- FIND NEAREST VALID OBSTACLE ----
+            # This implements the "find minimum non-zero distance" requirement
+            d_min, th_min = find_min_nonzero(ranges, thetas)
 
             if PRINT_DEBUG:
-                print(f"[CMD] vx={vx_cmd:+.3f} m/s, wz={wz_cmd:+.3f} rad/s | d={d:.3f} m, th={th:+.3f} rad")
+                if np.isfinite(d_min):
+                    print(f"[SCAN] Nearest obstacle: {d_min:.3f}m at {math.degrees(th_min):+.1f}°")
+                else:
+                    print("[SCAN] No valid obstacles detected (all zero/invalid).")
 
-            time.sleep(dt)
+            # ---- HANDLE NO TARGET ----
+            if not np.isfinite(d_min):
+                driver.send(0.0, 0.0, 0.0)
+                theta_smooth = None  # Reset smoothing
+                time.sleep(1.0 / LOOP_HZ)
+                continue
+
+            # ---- SMOOTH DIRECTION FOR STABILITY ----
+            # Initialize smoothing on first valid reading
+            if theta_smooth is None:
+                theta_smooth = th_min
+            else:
+                # Handle angle wrapping for smooth transitions
+                angle_diff = normalize_angle(th_min - theta_smooth)
+                theta_smooth = normalize_angle(theta_smooth + SMOOTH_ALPHA * angle_diff)
+
+            # ---- RADIAL P-CONTROL ON DISTANCE ----
+            # Error: positive = too far (move toward), negative = too close (back away)
+            # We want to REDUCE the error, so we move in the OPPOSITE direction of error
+            err = d_min - SETPOINT_M
+
+            # Apply deadband to prevent jitter when at setpoint
+            if abs(err) < DEADBAND_M:
+                vx_cmd = 0.0
+                vy_cmd = 0.0
+                
+                if PRINT_DEBUG:
+                    print(f"[CTRL] At setpoint (err={err:+.3f}m) - holding position")
+                    
+            else:
+                # P-control: velocity magnitude proportional to distance error
+                # NEGATIVE sign because we want to move TOWARD obstacle (reduce distance)
+                v_mag = -KP_DIST * err
+
+                # Apply velocity limits
+                v_sign = 1.0 if v_mag >= 0 else -1.0
+                v_mag = abs(v_mag)
+                v_mag = clamp(v_mag, 0.0, V_MAX)
+                
+                # Apply minimum velocity to overcome static friction
+                if v_mag > 0.0:
+                    v_mag = max(v_mag, V_MIN)
+                
+                # Restore sign
+                v_mag *= v_sign
+
+                # ---- CONVERT POLAR TO CARTESIAN ----
+                # Move in the direction of the obstacle (theta_smooth)
+                # Robot frame: +x forward, +y left
+                vx_cmd = v_mag * math.cos(theta_smooth)
+                vy_cmd = v_mag * math.sin(theta_smooth)
+                
+                if PRINT_DEBUG:
+                    print(f"[CTRL] err={err:+.3f}m → v_mag={v_mag:+.3f} m/s in direction {math.degrees(theta_smooth):+.1f}°")
+
+            # ---- SEND COMMANDS (NO ROTATION) ----
+            driver.send(vx_cmd, vy_cmd, 0.0)
+
+            if PRINT_DEBUG:
+                print(f"[CMD]  vx={vx_cmd:+.3f} m/s, vy={vy_cmd:+.3f} m/s, wz=+0.000 rad/s")
+                print("-" * 60)
+
+            # Maintain loop rate
+            elapsed = time.time() - loop_start
+            sleep_time = (1.0 / LOOP_HZ) - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
 
     except KeyboardInterrupt:
-        print("\n[INFO] Keyboard interrupt — stopping.")
+        print("\n[INFO] Keyboard interrupt received - stopping robot.")
     except Exception as e:
-        print(f"[ERROR] {e}")
+        print(f"[ERROR] Unexpected error: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
         driver.stop()
-        print("[INFO] Robot stopped safely.")
+        print("[INFO] Robot stopped safely. Program terminated.")
 
 if __name__ == "__main__":
     main()
-
-
