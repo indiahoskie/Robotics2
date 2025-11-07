@@ -61,7 +61,68 @@ def clamp(x, lo, hi):
 
 
 try:
-    print("[INFO] Starting wall follow
+    print("[INFO] Starting wall follower (shortest ray + cross product).")
+
+    while True:
+        ranges, thetas = robot.read_lidar()
+
+        # 1️⃣ Find the shortest valid distance & angle
+        d_min, th_min = find_min_dist(ranges, thetas)
+        if d_min is None or not math.isfinite(d_min):
+            robot.drive(0, 0, 0)
+            continue
+
+        # Smooth the distance slightly to avoid twitching
+        if _prev_d is None:
+            d_used = d_min
+        else:
+            d_used = alpha * d_min + (1 - alpha) * _prev_d
+        _prev_d = d_used
+
+        # 2️⃣ Compute wall normal vector (toward wall)
+        nx = math.cos(th_min)
+        ny = math.sin(th_min)
+        normal = [nx, ny, 0.0]
+
+        # 3️⃣ Compute tangent using cross product: t = n × k̂
+        tangent = cross_product(normal, [0.0, 0.0, 1.0])  # gives [ny, -nx, 0]
+        tx, ty, _ = tangent
+
+        # ensure tangent points generally forward
+        if tx < 0:
+            tx, ty = -tx, -ty
+
+        # normalize both
+        norm_n = math.hypot(nx, ny)
+        norm_t = math.hypot(tx, ty)
+        nx, ny = nx / norm_n, ny / norm_n
+        tx, ty = tx / norm_t, ty / norm_t
+
+        # 4️⃣ Compute distance error
+        error = setpoint - d_used
+
+        # 5️⃣ Lateral correction along normal
+        corr = 0.0 if abs(error) <= DEAD_BAND else KP * error
+
+        # 6️⃣ Final velocity: along wall tangent + normal correction
+        vx = V_TAN * tx + corr * nx
+        vy = V_TAN * ty + corr * ny
+
+        # clamp speeds
+        vx = clamp(vx, -V_MAX, V_MAX)
+        vy = clamp(vy, -V_MAX, V_MAX)
+
+        # 7️⃣ Drive the robot (no rotation)
+        robot.drive(vx, vy, 0.0)
+
+        time.sleep(0.1)
+
+except KeyboardInterrupt:
+    pass
+finally:
+    robot.stop()
+    print("[INFO] Robot stopped.")
+
 
 
 
